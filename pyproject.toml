@@ -1,0 +1,74 @@
+[project]
+name = "agent-sandbox"
+version = "0.1.0"
+description = "OS-level sandbox for AI agent tool execution (bubblewrap + seccomp + network allow-listing)"
+readme = "README.md"
+authors = [
+    { name = "nasirodin mazrooei" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic>=2.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/nasirodin/agent-sandbox"
+Repository = "https://github.com/nasirodin/agent-sandbox"
+Issues = "https://github.com/nasirodin/agent-sandbox/issues"
+
+[project.scripts]
+sandbox = "sandbox.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Distribution is "agent-sandbox"; the import package stays "sandbox".
+module-name = "sandbox"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+venvPath = "."
+venv = ".venv"
+# Target platform is Linux/WSL2; the package uses Linux-only APIs.
+pythonPlatform = "Linux"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.format]
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+# Explicit list so a ruff upgrade can't silently change what CI enforces.
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "UP",      # pyupgrade
+    "B",       # bugbear
+    "BLE",     # blind except
+    "SIM",     # simplify
+    "RUF",     # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sandbox"]
