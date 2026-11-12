@@ -15,18 +15,22 @@ import re
 import secrets
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TextIO
 
 from pydantic import BaseModel
 
 from sandbox.linux.bwrap import MountPlan, bwrap_argv, plan_mounts
 from sandbox.linux.seccomp import build_filter, host_arch
+from sandbox.net.events import NetworkEvent
 from sandbox.net.filter import AddressGuard, ApprovalCallback, parse_network
-from sandbox.net.proxy import ConnectionRecord, FilteringProxy
+from sandbox.net.mitm import CertificateAuthority, trust_bundle
+from sandbox.net.proxy import FilteringProxy
 from sandbox.policy import ResourceLimits, SandboxPolicy
 from sandbox.violations import Violation, network_violations, stderr_violations
 
@@ -35,6 +39,8 @@ SOCKS_PORT = 1080
 SERVICE_PORT_BASE = 3200
 DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin"
 MIN_BWRAP = (0, 5, 0)
+MAX_EXEC_EVENTS = 1000
+"""Network events (and network violations) kept per exec result; the audit log has all."""
 BRIDGE = Path(__file__).with_name("bridge.py")
 
 
@@ -51,6 +57,10 @@ class ExecResult(BaseModel):
     violations: list[Violation]
     duration_s: float
     timed_out: bool
+    network_events: list[NetworkEvent] = []
+    """Every network decision of the exec, in order (the first MAX_EXEC_EVENTS)."""
+    network_events_dropped: int = 0
+    """Events beyond MAX_EXEC_EVENTS, left out of `network_events` (not of the audit log)."""
 
 
 def check_host(policy: SandboxPolicy) -> list[str]:
@@ -82,10 +92,16 @@ class Sandbox:
         policy: SandboxPolicy,
         session_dir: Path,
         approve: ApprovalCallback | None = None,
+        event_log: Path | None = None,
     ) -> None:
+        """`event_log`: append every network event of every exec to this file, one JSON
+        object per line (`NetworkEvent`). It is hidden from the sandbox, whose own and other
+        execs' request targets it records."""
         self.policy = policy
         self.session_dir = session_dir.resolve()
         self.approve = approve
+        self.event_log = event_log.resolve() if event_log is not None else None
+        self._log: TextIO | None = None
         self._started = False
         self._active = 0
         self._placeholders: set[str] = set()
@@ -121,18 +137,37 @@ class Sandbox:
             str(BRIDGE.parent.resolve()),
         ]
         net = self.policy.network
-        self._allowed, self._denied = net.allowed_rules(), net.denied_rules()
+        self._hosts = net.host_rules()
         self._guard = AddressGuard(
             extra=net.denied_resolved_addresses,
             deny_private=net.deny_private_addresses,
-            allowed_literals=self._allowed,
+            allowed_literals=[r.domain for r in self._hosts if r.access != "deny"],
         )
+        self._ca: CertificateAuthority | None = None
+        self._upstream_tls: ssl.SSLContext | None = None
+        self._tls_dir: Path | None = None
+        if any(r.access == "inspect" for r in self._hosts):
+            # `inspect` hosts are filtered by intercepting TLS: a per-session CA the sandbox
+            # is told to trust (via *_CA_BUNDLE / SSL_CERT_FILE on top of the system store)
+            self._ca = CertificateAuthority(self.session_dir / "ca")
+            self._upstream_tls = ssl.create_default_context()
+            self._tls_dir = self.session_dir / "tls"
+            self._tls_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            (self._tls_dir / "ca.pem").write_bytes(self._ca.ca_pem)
+            (self._tls_dir / "cacert.pem").write_bytes(trust_bundle(self._ca.ca_pem))
+        if self.event_log is not None and self._log is None:
+            self.event_log.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.event_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            self._log = open(fd, "a", encoding="utf-8")  # noqa: SIM115 - closed in stop()
         self._sem = asyncio.Semaphore(self.policy.limits.max_concurrent)
         self._started = True
 
     async def stop(self) -> None:
         for proc in list(self._procs):
             _kill(proc)
+        if self._log is not None:
+            self._log.close()
+            self._log = None
         self._started = False
 
     async def __aenter__(self) -> Sandbox:
@@ -171,16 +206,17 @@ class Sandbox:
         started = time.monotonic()
         exec_id = secrets.token_hex(8)
         sock = str(self.sock_dir / f"{exec_id}.sock")
-        records: list[ConnectionRecord] = []
+        events = _EventSink(self._log)
         proxy = FilteringProxy(
             sock,
             exec_id=exec_id,
-            allowed=self._allowed,
-            denied=self._denied,
+            hosts=self._hosts,
             extra_allowed=parse_network(extra_allowed, allow_star=False),
             guard=self._guard,
+            ca=self._ca,
+            upstream_tls=self._upstream_tls,
             approve=self.approve,
-            on_record=records.append,
+            on_event=events,
         )
         await proxy.start()
         os.chmod(sock, 0o600)
@@ -195,7 +231,7 @@ class Sandbox:
             if self._active == 0:
                 self._remove_placeholders()
         exit_code, stdout, stderr, truncated, timed_out = out
-        violations = network_violations(records) + stderr_violations(stderr, plan.protected)
+        violations = events.violations + stderr_violations(stderr, plan.protected)
         return ExecResult(
             exit_code=exit_code,
             stdout=stdout,
@@ -204,6 +240,8 @@ class Sandbox:
             violations=violations,
             duration_s=round(time.monotonic() - started, 3),
             timed_out=timed_out,
+            network_events=events.events,
+            network_events_dropped=events.dropped,
         )
 
     def _prepare(
@@ -228,11 +266,24 @@ class Sandbox:
             "NO_PROXY": "localhost,127.0.0.1,::1",
             "no_proxy": "localhost,127.0.0.1,::1",
         }
+        if self._tls_dir is not None:
+            # so common TLS stacks trust the interception CA for `inspect` hosts
+            bundle = str(self._tls_dir / "cacert.pem")
+            full_env |= {
+                "SSL_CERT_FILE": bundle,
+                "REQUESTS_CA_BUNDLE": bundle,
+                "CURL_CA_BUNDLE": bundle,
+                "GIT_SSL_CAINFO": bundle,
+                "PIP_CERT": bundle,
+                "NODE_EXTRA_CA_CERTS": str(self._tls_dir / "ca.pem"),
+            }
         full_env |= env or {}  # per-exec values last; proxy variables grant nothing anyway
         plan = plan_mounts(
             self.policy.filesystem,
             extra_read=self._runtime_read,
             socket_binds=[sock, *net.services.values()],
+            ro_binds=[str(self._tls_dir)] if self._tls_dir is not None else [],
+            hidden=[str(self.event_log)] if self.event_log is not None else [],
             empty_dir=str(self.empty_dir),
         )
         self._placeholders.update(plan.placeholders)
@@ -265,6 +316,28 @@ class Sandbox:
             except OSError:
                 pass
         self._placeholders.clear()
+
+
+class _EventSink:
+    """One exec's network events: kept for its result (capped) and appended to the audit
+    log (all of them)."""
+
+    def __init__(self, log: TextIO | None) -> None:
+        self.events: list[NetworkEvent] = []
+        self.violations: list[Violation] = []
+        self.dropped = 0
+        self._log = log
+
+    def __call__(self, event: NetworkEvent) -> None:
+        if len(self.events) < MAX_EXEC_EVENTS:
+            self.events.append(event)
+        else:
+            self.dropped += 1
+        if len(self.violations) < MAX_EXEC_EVENTS:
+            self.violations += network_violations([event])
+        if self._log is not None:
+            self._log.write(event.model_dump_json() + "\n")
+            self._log.flush()
 
 
 class _Capture:

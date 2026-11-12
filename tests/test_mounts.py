@@ -149,3 +149,37 @@ def test_missing_paths_are_skipped(tmp_path: Path) -> None:
     assert p.write_roots == []
     assert not any("nope" in a or "gone" in a for a in p.args)
     assert os.path.exists(tmp_path / "empty")
+
+
+def test_ro_binds_follow_socket_binds(tmp_path: Path) -> None:
+    tls = tmp_path / "tls"
+    tls.mkdir()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    sock = str(tmp_path / "p.sock")
+    p = plan_mounts(
+        FilesystemPolicy(), socket_binds=[sock], ro_binds=[str(tls)], empty_dir=str(empty)
+    )
+    mounts = triples(p.args)
+    # read-only, after the socket bind so it stays visible under /tmp's fresh tmpfs
+    assert ("--ro-bind", str(tls), str(tls)) in mounts
+    assert mounts.index(("--bind", sock, sock)) < mounts.index(("--ro-bind", str(tls), str(tls)))
+
+
+def test_hidden_files_are_denied_read(tmp_path: Path) -> None:
+    log = tmp_path / "ws" / "network.jsonl"
+    log.parent.mkdir()
+    log.write_text("")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    p = plan_mounts(
+        FilesystemPolicy(allow_write=[str(log.parent)]),
+        hidden=[str(log), "/dev/stderr", str(tmp_path / "missing")],
+        empty_dir=str(empty),
+    )
+    mounts = triples(p.args)
+    assert ("--ro-bind", "/dev/null", str(log)) in mounts  # after the write root's bind
+    assert mounts.index(("--bind", str(log.parent), str(log.parent))) < mounts.index(
+        ("--ro-bind", "/dev/null", str(log))
+    )
+    assert not any("stderr" in a or "missing" in a for a in p.args)

@@ -5,8 +5,10 @@ Mirrors srt's `domain-pattern.ts`, `filterNetworkRequest` and `resolved-address-
 - Hosts are validated and canonicalised before any rule sees them (lower case, no trailing
   dot, IPv6 compressed, IPv4-mapped IPv6 and inet_aton shorthand such as `127.1` or
   `2130706433` turned into dotted quads), and the canonical form is what gets dialed.
-- Rules: `deny` list first, then the `allow` list, then per-exec extra allows, then the
-  approval callback; anything else is denied. Only a literal `True` from the callback allows.
+- Hosts (`HostRule`, from `NetworkPolicy.hosts`): among the entries covering a host the most
+  restrictive access wins - `deny`, then `inspect` (allowed, but the proxy vets every
+  request), then `tunnel`; then per-exec extra allows, then the approval callback; anything
+  else is denied. Only a literal `True` from the callback allows.
 - An allowed *hostname* is resolved once; addresses in the denied set are dropped and a
   surviving address is dialed directly (no second lookup, so DNS rebinding gains nothing).
   IP literals are judged by the rules alone.
@@ -17,8 +19,10 @@ import ipaddress
 import itertools
 import re
 import socket
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
+from typing import Literal
+from urllib.parse import parse_qsl, unquote
 
 type IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 type IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -104,7 +108,7 @@ def parse_rule(entry: str, *, allow_star: bool) -> DomainRule:
 
     if host == "*":
         if not allow_star:
-            raise ValueError("`*` is only allowed in denied_domains")
+            raise ValueError("`*` is only allowed in deny entries")
         return DomainRule("*", port, entry)
     if host.startswith("*."):
         base = canonicalize_host(host[2:])
@@ -133,6 +137,244 @@ def parse_network(entries: Iterable[str], *, allow_star: bool) -> list[DomainRul
     return [parse_rule(e, allow_star=allow_star) for e in entries]
 
 
+# --- inspected hosts ---------------------------------------------------------------------
+
+_METHOD = re.compile(r"^[A-Za-z]+$")
+_PATH_GLOB = re.compile(r"^/[\x21-\x7e]*$")  # absolute, printable ASCII, no spaces
+MAX_TARGET = 4096
+"""Longest request target the rules will consider (longer is refused outright)."""
+
+
+def glob_match(pattern: str, text: str) -> bool:
+    """Wildcard match: `*` any run of characters, `?` exactly one. Greedy two-pointer scan,
+    so untrusted text cannot trigger the catastrophic backtracking a regex translation of
+    the same glob could."""
+    pi = ti = 0
+    star = star_ti = -1
+    while ti < len(text):
+        if pi < len(pattern) and (pattern[pi] == text[ti] or pattern[pi] == "?"):
+            pi += 1
+            ti += 1
+        elif pi < len(pattern) and pattern[pi] == "*":
+            star, star_ti = pi, ti
+            pi += 1
+        elif star != -1:  # rewind: let the last `*` swallow one more character
+            pi = star + 1
+            star_ti += 1
+            ti = star_ti
+        else:
+            return False
+    return all(c == "*" for c in pattern[pi:])
+
+
+@dataclass(frozen=True)
+class PathGlob:
+    """Compiled path glob: `*` and `?` match within one segment, and a whole `**` segment
+    (None below) matches zero or more segments, so `/repos/**` also matches `/repos`."""
+
+    segments: tuple[str | None, ...]
+    source: str
+
+    @classmethod
+    def parse(cls, pattern: str) -> PathGlob:
+        if not _PATH_GLOB.match(pattern) or "#" in pattern:
+            raise ValueError(f"path glob must be an absolute, printable path: {pattern!r}")
+        segments: list[str | None] = []
+        for segment in pattern.split("/")[1:]:
+            if "**" in segment and segment != "**":
+                raise ValueError(f"`**` must be a whole path segment: {pattern!r}")
+            segments.append(None if segment == "**" else segment)
+        return cls(tuple(segments), pattern)
+
+    def matches(self, path: str) -> bool:
+        if not path.startswith("/"):
+            return False
+        pats, segs = self.segments, path.split("/")[1:]
+        pi = si = 0
+        star = star_si = -1
+        while si < len(segs):
+            if pi < len(pats) and (pat := pats[pi]) is not None and glob_match(pat, segs[si]):
+                pi += 1
+                si += 1
+            elif pi < len(pats) and pats[pi] is None:
+                star, star_si = pi, si
+                pi += 1
+            elif star != -1:  # rewind: let the last `**` swallow one more segment
+                pi = star + 1
+                star_si += 1
+                si = star_si
+            else:
+                return False
+        return all(p is None for p in pats[pi:])
+
+
+@dataclass(frozen=True)
+class _Request:
+    """The parts of a request the filters look at, normalised once."""
+
+    method: str
+    """Upper case."""
+    path: str
+    """Percent-decoded (the escapes that could change its structure are refused earlier)."""
+    bare_path: str
+    """`path` with `;params` cut from every segment, as some servers do before routing."""
+    params: list[tuple[str, str]]
+    """Decoded query pairs, split on `&` and, as a superset, also on `;`."""
+
+
+@dataclass(frozen=True)
+class RequestFilter:
+    """One compiled request filter of an inspected host.
+
+    In an allow list a filter matches when the method is listed, the path matches, and each
+    named query parameter is present with every occurrence matching its glob. In a deny list
+    it matches more eagerly - the path with or without `;params`, and a parameter when any
+    occurrence matches - so a request dressed up to dodge a deny filter is still caught.
+    """
+
+    methods: frozenset[str]
+    """Upper case; empty matches every method."""
+    path_glob: PathGlob
+    query: tuple[tuple[str, str], ...]
+    source: str
+
+    def matches(self, req: _Request, *, deny: bool) -> bool:
+        if self.methods and req.method not in self.methods:
+            return False
+        paths = (req.path, req.bare_path) if deny else (req.path,)
+        if not any(self.path_glob.matches(p) for p in paths):
+            return False
+        for name, pattern in self.query:
+            values = [v for k, v in req.params if k == name]
+            hits = [glob_match(pattern, v) for v in values]
+            if not (any(hits) if deny else hits and all(hits)):
+                return False
+        return True
+
+
+def parse_request_filter(
+    methods: Iterable[str] = (), path: str = "/**", query: dict[str, str] | None = None
+) -> RequestFilter:
+    upper: list[str] = []
+    for m in methods:
+        if not _METHOD.match(m):
+            raise ValueError(f"bad HTTP method: {m!r}")
+        upper.append(m.upper())
+    for name in query or {}:
+        if not name or not name.isascii() or not name.isprintable():
+            raise ValueError(f"bad query parameter name: {name!r}")
+    q = "&".join(f"{k}={v}" for k, v in (query or {}).items())
+    source = f"{','.join(sorted(upper)) or '*'} {path}{'?' + q if q else ''}"
+    pairs = tuple((query or {}).items())
+    return RequestFilter(frozenset(upper), PathGlob.parse(path), pairs, source)
+
+
+type Access = Literal["tunnel", "deny", "inspect"]
+ACCESS: tuple[Access, ...] = ("tunnel", "deny", "inspect")
+
+
+@dataclass(frozen=True)
+class HostRule:
+    """One compiled `NetworkPolicy.hosts` entry.
+
+    - `deny`: connections are refused.
+    - `tunnel`: connections are allowed and relayed untouched (nothing is decrypted).
+    - `inspect`: reachable through the HTTP proxy only; TLS is intercepted and every request
+      must match no `deny` filter and at least one `allow` filter.
+    """
+
+    domain: DomainRule
+    access: Access
+    allow: tuple[RequestFilter, ...] = ()
+    deny: tuple[RequestFilter, ...] = ()
+
+    def covers(self, host: str, port: int) -> bool:
+        return self.domain.matches(host, port)
+
+
+def parse_host_rule(
+    host: str,
+    access: Access,
+    allow: Iterable[RequestFilter] = (),
+    deny: Iterable[RequestFilter] = (),
+) -> HostRule:
+    if access not in ACCESS:
+        raise ValueError(f"access must be one of {', '.join(ACCESS)}: {access!r}")
+    allow, deny = tuple(allow), tuple(deny)
+    if access != "inspect" and (allow or deny):
+        raise ValueError(f"only `inspect` hosts take allow/deny request filters: {host!r}")
+    if access == "inspect" and not allow:
+        raise ValueError(f"an `inspect` host needs at least one allow filter: {host!r}")
+    domain = parse_rule(host, allow_star=access == "deny")
+    return HostRule(domain, access, allow, deny)
+
+
+def _request_view(method: str, path: str, query: str) -> _Request:
+    decoded = unquote(path, errors="replace")
+    bare = "/".join(segment.partition(";")[0] for segment in decoded.split("/"))
+    params = parse_qsl(query, keep_blank_values=True)
+    if ";" in query:
+        params += parse_qsl(query.replace(";", "&"), keep_blank_values=True)
+    return _Request(method.upper(), decoded, bare, params)
+
+
+@dataclass(frozen=True)
+class RequestVerdict:
+    allowed: bool
+    reason: str
+    rule: str | None = None
+    """The filter that decided, as `<host entry>: <allow|deny> <filter>`; None for the
+    built-in refusals and when no allow filter matches."""
+
+
+def request_denial(rules: Sequence[HostRule], method: str, target: str) -> str | None:
+    """Why `method` on the origin-form `target` is refused by `rules`, or None."""
+    verdict = judge_request(rules, method, target)
+    return None if verdict.allowed else verdict.reason
+
+
+def judge_request(rules: Sequence[HostRule], method: str, target: str) -> RequestVerdict:
+    """Judge `method` on the origin-form `target` against the inspected hosts `rules`. Deny
+    comes first: the built-in checks below, then every deny filter, and only then the
+    allow filters.
+
+    Filters see the percent-decoded path. Escapes that would change its structure (`%2e`,
+    `%2f`, `%5c`, `%00`) and dot segments are refused outright, so decoding cannot turn a
+    request into one that reaches a different resource than the filters saw.
+    """
+    refused = _refusal_before_filters(target)
+    if refused is not None:
+        return RequestVerdict(False, refused)
+    path, _, query = target.partition("?")
+    req = _request_view(method, path, query)
+    for r in rules:
+        for f in r.deny:
+            if f.matches(req, deny=True):
+                rule = f"{r.domain.source}: deny {f.source}"
+                return RequestVerdict(False, "request matches a deny filter", rule)
+    for r in rules:
+        for f in r.allow:
+            if f.matches(req, deny=False):
+                return RequestVerdict(
+                    True, "allow filter matches", f"{r.domain.source}: allow {f.source}"
+                )
+    return RequestVerdict(False, "no allow filter matches")
+
+
+def _refusal_before_filters(target: str) -> str | None:
+    if len(target) > MAX_TARGET:
+        return "request target too long"
+    path = target.partition("?")[0]
+    low = path.lower()
+    if not path.startswith("/"):
+        return "request target is not an absolute path"
+    if any(segment in (".", "..") for segment in path.split("/")):
+        return "dot segment in request path"
+    if "\\" in path or any(e in low for e in ("%2e", "%2f", "%5c", "%00")):
+        return "escaped dot or slash in request path"
+    return None
+
+
 # --- decisions ---------------------------------------------------------------------------
 
 
@@ -153,6 +395,12 @@ class Decision:
     reason: str
     host: str
     """Canonical host when valid, else the host as requested."""
+    inspect: bool = False
+    """Allowed for inspection only: the proxy must vet every request (see `HostRule`)."""
+    rule: str | None = None
+    """The entry that decided: a `NetworkPolicy.hosts` pattern or `exec: <entry>`."""
+    malformed: bool = False
+    """Refused because the host or port is not valid at all, before any rule was asked."""
 
 
 async def decide(
@@ -160,20 +408,27 @@ async def decide(
     port: int,
     *,
     exec_id: str,
-    allowed: list[DomainRule],
-    denied: list[DomainRule],
-    extra_allowed: list[DomainRule] = [],  # noqa: B006 - never mutated
+    hosts: Sequence[HostRule],
+    extra_allowed: Sequence[DomainRule] = (),
     approve: ApprovalCallback | None = None,
 ) -> Decision:
     canon = canonicalize_host(host)
     if canon is None or not 0 < port < 65536:
-        return Decision(False, "malformed host", host)
-    if any(r.matches(canon, port) for r in denied):
-        return Decision(False, "host is on the deny list", canon)
-    if any(r.matches(canon, port) for r in allowed):
-        return Decision(True, "allow list", canon)
-    if any(r.matches(canon, port) for r in extra_allowed):
-        return Decision(True, "exec allow list", canon)
+        return Decision(False, "malformed host", host, malformed=True)
+    covering = [r for r in hosts if r.covers(canon, port)]
+
+    def entry(access: Access) -> str | None:
+        return next((r.domain.source for r in covering if r.access == access), None)
+
+    # the most restrictive access wins: an inspected host is never also tunnelled
+    if rule := entry("deny"):
+        return Decision(False, "host is denied", canon, rule=rule)
+    if rule := entry("inspect"):
+        return Decision(True, "inspect", canon, inspect=True, rule=rule)
+    if rule := entry("tunnel"):
+        return Decision(True, "tunnel", canon, rule=rule)
+    if extra := next((r for r in extra_allowed if r.matches(canon, port)), None):
+        return Decision(True, "exec allow list", canon, rule=f"exec: {extra.source}")
     if approve is not None:
         try:
             answer = await approve(NetworkRequest(canon, port, exec_id))
@@ -182,7 +437,7 @@ async def decide(
         if answer is True:
             return Decision(True, "approved", canon)
         return Decision(False, "not approved", canon)
-    return Decision(False, "host is not on the allow list", canon)
+    return Decision(False, "host is not allowed", canon)
 
 
 # --- resolved-address guard ------------------------------------------------------------
@@ -322,17 +577,28 @@ def sanitize(text: str, limit: int = 500) -> str:
 
 
 __all__ = [
+    "ACCESS",
+    "Access",
     "AddressDenied",
     "AddressGuard",
     "ApprovalCallback",
     "Decision",
     "DomainRule",
+    "HostRule",
     "NetworkRequest",
+    "PathGlob",
+    "RequestFilter",
+    "RequestVerdict",
     "canonicalize_host",
     "decide",
     "embedded_ipv4",
+    "glob_match",
+    "judge_request",
     "local_addresses",
+    "parse_host_rule",
     "parse_network",
+    "parse_request_filter",
     "parse_rule",
+    "request_denial",
     "sanitize",
 ]

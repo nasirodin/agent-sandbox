@@ -17,7 +17,8 @@ Mount order matters, later mounts shadow earlier ones:
    - deny_write: read-only bind of the path itself, or of a placeholder at its first missing
      component (an empty file for the leaf, an empty directory above it) so it cannot be
      created; skipped where a deny_read region already hides it.
-5. Service/proxy socket files, then the placeholder source directory read-only.
+5. Service/proxy socket files, extra read-only binds (the TLS CA bundle for `inspect`),
+   then the placeholder source directory read-only.
 
 Every path is resolved (symlinks followed) before use: bubblewrap mounts on what a name leads
 to, and a bind source must be the real location.
@@ -85,9 +86,13 @@ def plan_mounts(
     *,
     extra_read: Sequence[str] = (),
     socket_binds: Sequence[str] = (),
+    ro_binds: Sequence[str] = (),
+    hidden: Sequence[str] = (),
     empty_dir: str,
 ) -> MountPlan:
-    deny_read = _existing(fs.deny_read)
+    """`hidden`: extra paths treated like `deny_read` (host-side files such as the network
+    audit log); only existing regular files and directories are hidden."""
+    deny_read = _existing([*fs.deny_read, *(h for h in hidden if _hideable(h))])
     allow_read = _existing([*fs.allow_read, *extra_read])
     deny_write_cfg = [_resolve(p) for p in fs.deny_write]
     # a write deny wins over a write allow at or below it
@@ -154,8 +159,18 @@ def plan_mounts(
         args += a
     for s in socket_binds:
         args += ["--bind", s, s]
+    for p in ro_binds:  # visible even under a tmpfs or deny_read (e.g. the TLS CA bundle)
+        args += ["--ro-bind", _resolve(p), p]
     args += ["--ro-bind", empty_dir, empty_dir]
     return MountPlan(args, allow_write, placeholders, protected)
+
+
+def _hideable(p: str) -> bool:
+    try:
+        mode = os.stat(p).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) or stat.S_ISDIR(mode)  # not /dev/stderr and the like
 
 
 def _existing(paths: Sequence[str]) -> list[str]:

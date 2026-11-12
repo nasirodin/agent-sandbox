@@ -9,8 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from sandbox.net.events import NetworkEvent
 from sandbox.net.filter import sanitize
-from sandbox.net.proxy import ConnectionRecord
 
 MAX_VIOLATIONS = 20
 
@@ -20,12 +20,10 @@ class Violation(BaseModel):
     detail: str
 
 
-def network_violations(records: Iterable[ConnectionRecord]) -> list[Violation]:
-    return [
-        Violation(kind="network", detail=f"deny {r.protocol} {r.host}:{r.port} ({r.reason})")
-        for r in records
-        if not r.allowed
-    ]
+def network_violations(events: Iterable[NetworkEvent]) -> list[Violation]:
+    """Policy denials and malformed input; allowed requests that failed upstream are not
+    the sandbox's doing."""
+    return [Violation(kind="network", detail=e.summary()) for e in events if e.violation]
 
 
 def stderr_violations(stderr: str, protected: Iterable[str] = ()) -> list[Violation]:

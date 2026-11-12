@@ -9,7 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from sandbox import FilesystemPolicy, NetworkPolicy, Sandbox, SandboxPolicy
+from sandbox import (
+    FilesystemPolicy,
+    HostAccess,
+    NetworkPolicy,
+    RequestFilter,
+    Sandbox,
+    SandboxPolicy,
+)
+from sandbox.net.events import NetworkEvent
+from sandbox.net.mitm import CertificateAuthority
 from sandbox.policy import ResourceLimits
 
 pytestmark = pytest.mark.skipif(
@@ -43,10 +52,10 @@ async def upstream() -> AsyncIterator[int]:
     server.close()
 
 
-def make(dirs: dict[str, Path], allowed_domains: list[str] = []) -> Sandbox:  # noqa: B006
+def make(dirs: dict[str, Path], tunnel: list[str] = []) -> Sandbox:  # noqa: B006
     policy = SandboxPolicy(
         filesystem=FilesystemPolicy(deny_read=[str(dirs["secret"])], allow_write=[str(dirs["ws"])]),
-        network=NetworkPolicy(allowed_domains=allowed_domains),
+        network=NetworkPolicy(hosts={h: HostAccess(access="tunnel") for h in tunnel}),
         limits=ResourceLimits(max_output_bytes=4096),
         env={"HOME": str(dirs["ws"])},
     )
@@ -112,7 +121,7 @@ async def test_kernel_escapes(dirs: dict[str, Path]) -> None:
 
 async def test_network(dirs: dict[str, Path], upstream: int) -> None:
     allowed = [f"127.0.0.1:{upstream}"]
-    async with make(dirs, allowed_domains=allowed) as sb:
+    async with make(dirs, tunnel=allowed) as sb:
         fetch = (
             "import urllib.request as u, sys; "
             "print(u.urlopen(sys.argv[1], timeout=10).read().decode())"
@@ -122,7 +131,7 @@ async def test_network(dirs: dict[str, Path], upstream: int) -> None:
         assert r.stdout == "ok\n", r.stderr
         r = await sb.exec(["python3", "-c", fetch, "http://example.com/"], env=env)
         assert "403" in r.stderr
-        assert r.violations[0].detail == "deny http example.com:80 (host is not on the allow list)"
+        assert r.violations[0].detail == "deny http example.com:80 (host is not allowed: GET /)"
         r = await sb.exec(
             ["python3", "-c", fetch, "http://example.com/"],
             env=env,
@@ -152,3 +161,94 @@ async def test_parallel_execs(dirs: dict[str, Path]) -> None:
         results = await asyncio.gather(*(sh(sb, f"echo {i}") for i in range(6)))
         assert [r.stdout for r in results] == [f"{i}\n" for i in range(6)]
     assert not os.listdir(dirs["session"] / "sock")
+
+
+@pytest.fixture
+async def tls_upstream(tmp_path: Path) -> AsyncIterator[tuple[int, CertificateAuthority]]:
+    ca = CertificateAuthority(tmp_path / "upstream-ca")
+
+    async def handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        head = await r.readuntil(b"\r\n\r\n")
+        body = b"ok" if head.startswith(b"GET /ok/") else b"??"
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n" + body)
+        await w.drain()
+        w.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ca.server_context("127.0.0.1"))
+    yield server.sockets[0].getsockname()[1], ca
+    server.close()
+
+
+async def test_request_rules(
+    dirs: dict[str, Path], tls_upstream: tuple[int, CertificateAuthority]
+) -> None:
+    port, upstream_ca = tls_upstream
+    policy = SandboxPolicy(
+        filesystem=FilesystemPolicy(allow_write=[str(dirs["ws"])]),
+        network=NetworkPolicy(
+            hosts={
+                f"127.0.0.1:{port}": HostAccess(
+                    access="inspect",
+                    allow=[RequestFilter(methods=["GET", "POST"], path="/ok/**")],
+                    deny=[RequestFilter(methods=["POST"])],
+                )
+            }
+        ),
+        limits=ResourceLimits(max_output_bytes=4096),
+        env={"HOME": str(dirs["ws"])},
+    )
+    env = {"NO_PROXY": "", "no_proxy": ""}
+    fetch = (
+        "import urllib.request as u, sys; print(u.urlopen(sys.argv[1], timeout=10).read().decode())"
+    )
+    async with Sandbox(policy, dirs["session"]) as sb:
+        assert sb._upstream_tls is not None
+        sb._upstream_tls.load_verify_locations(cadata=upstream_ca.ca_pem.decode())
+        url = f"https://127.0.0.1:{port}"
+        r = await sb.exec(["python3", "-c", fetch, f"{url}/ok/data"], env=env)
+        assert r.stdout == "ok\n", r.stderr  # intercepted, vetted, re-encrypted upstream
+        assert not r.violations
+        r = await sb.exec(["python3", "-c", fetch, f"{url}/admin"], env=env)
+        assert "403" in r.stderr and r.stdout == ""
+        assert r.violations[0].detail == (
+            f"deny https 127.0.0.1:{port} (no allow filter matches: GET /admin)"
+        )
+        post = "import urllib.request as u, sys; u.urlopen(sys.argv[1], data=b'x', timeout=10)"
+        r = await sb.exec(["python3", "-c", post, f"{url}/ok/data"], env=env)
+        assert "403" in r.stderr and "request matches a deny filter" in r.violations[0].detail
+        # a client that refuses the interception certificate gets nothing, leaks nothing
+        r = await sb.exec(
+            ["python3", "-c", fetch, f"{url}/ok/data"],
+            env={**env, "SSL_CERT_FILE": "/dev/null"},
+        )
+        assert "CERTIFICATE_VERIFY_FAILED" in r.stderr and r.stdout == ""
+
+
+async def test_network_audit_log(dirs: dict[str, Path], upstream: int) -> None:
+    log = dirs["ws"] / "audit" / "network.jsonl"  # worst case: inside the writable workspace
+    policy = SandboxPolicy(
+        filesystem=FilesystemPolicy(allow_write=[str(dirs["ws"])]),
+        network=NetworkPolicy(hosts={f"127.0.0.1:{upstream}": HostAccess(access="tunnel")}),
+        env={"HOME": str(dirs["ws"])},
+    )
+    probe = (
+        "import socket, urllib.request as u, sys\n"
+        "print(u.urlopen(sys.argv[1], timeout=10).read().decode())\n"
+        "s = socket.create_connection(('127.0.0.1', 3128)); s.sendall(b'NONSENSE\\r\\n\\r\\n')\n"
+        "print(s.recv(100).split(b'\\r\\n')[0].decode())\n"
+    )
+    env = {"NO_PROXY": "", "no_proxy": ""}
+    async with Sandbox(policy, dirs["session"], event_log=log) as sb:
+        r = await sb.exec(["python3", "-c", probe, f"http://127.0.0.1:{upstream}/ok"], env=env)
+        assert r.stdout == "ok\nHTTP/1.1 400 bad request line\n", r.stderr
+        hide = await sb.exec(["sh", "-c", f"cat {log}; echo x >> {log} || echo ro; rm {log}"])
+    assert hide.stdout == "ro\n"  # the sandbox sees an empty, read-only, undeletable file
+    lines = [NetworkEvent.model_validate_json(line) for line in log.read_text().splitlines()]
+    assert lines == r.network_events  # the log has exactly what the result reported
+    assert [(e.decision, e.protocol, e.reason, e.target) for e in lines] == [
+        ("allow", "http", "tunnel", "/ok"),
+        ("malformed", "http", "bad request line", None),
+    ]
+    assert {e.exec_id for e in lines} == {r.network_events[0].exec_id}
+    assert lines[0].connection != lines[1].connection
+    assert [v.detail for v in r.violations] == ["malformed http (bad request line)"]

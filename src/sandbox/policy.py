@@ -10,9 +10,10 @@ because a deny glob that silently matches nothing is a hole.
 import ipaddress
 from pathlib import PurePosixPath
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from sandbox.net.filter import DomainRule, parse_network
+from sandbox.net.filter import Access, HostRule, parse_host_rule, parse_request_filter
+from sandbox.net.filter import RequestFilter as CompiledFilter
 
 
 class _Strict(BaseModel):
@@ -49,11 +50,60 @@ class FilesystemPolicy(_Strict):
         return _absolute(v)
 
 
+class RequestFilter(_Strict):
+    """Matches requests to an `inspect` host (see `HostAccess.allow` / `HostAccess.deny`)."""
+
+    methods: list[str] = []
+    """HTTP methods, e.g. `["GET", "HEAD"]` (case-insensitive); empty matches every method."""
+    path: str = "/**"
+    """Glob over the percent-decoded request path: `*` within one segment, `?` one character,
+    a whole `**` segment zero or more segments (`/repos/**` also matches `/repos`; `**` is
+    only valid as a whole segment)."""
+    query: dict[str, str] = {}
+    """Query parameter -> value glob (`*`/`?`); parameters not named are unconstrained. In an
+    allow filter each parameter must be present and every occurrence must match; in a deny
+    filter one matching occurrence is enough."""
+
+    @model_validator(mode="after")
+    def _compiles(self) -> RequestFilter:
+        self.compile()
+        return self
+
+    def compile(self) -> CompiledFilter:
+        return parse_request_filter(self.methods, self.path, self.query)
+
+
+class HostAccess(_Strict):
+    """How the sandbox may reach one host (see `NetworkPolicy.hosts`)."""
+
+    access: Access
+    """`tunnel`: connections are relayed untouched (nothing is decrypted). `deny`: connections
+    are refused. `inspect`: TLS is intercepted with a per-session CA the sandbox trusts via
+    SSL_CERT_FILE and friends, and every request must match no `deny` filter and at least
+    one `allow` filter; reachable through the HTTP proxy only (not SOCKS)."""
+    allow: list[RequestFilter] = []
+    """`inspect` only, and required: the requests that may pass."""
+    deny: list[RequestFilter] = []
+    """`inspect` only: requests refused even when an allow filter matches (checked first).
+    Requests with dot segments, `%2e`/`%2f`/`%5c`/`%00` escapes or very long targets are
+    always refused."""
+
+    @model_validator(mode="after")
+    def _filters_fit_access(self) -> HostAccess:
+        if self.access != "inspect" and (self.allow or self.deny):
+            raise ValueError("only `inspect` hosts take allow/deny request filters")
+        if self.access == "inspect" and not self.allow:
+            raise ValueError("an `inspect` host needs at least one allow filter")
+        return self
+
+
 class NetworkPolicy(_Strict):
-    allowed_domains: list[str] = []
-    """`pypi.org`, `*.pythonhosted.org`, `api.x.com:443`, `[::1]:8080`, `127.0.0.1:3000`."""
-    denied_domains: list[str] = []
-    """Checked first. Also accepts `*` and `*:<port>`."""
+    hosts: dict[str, HostAccess] = {}
+    """Host pattern -> access. Patterns: `pypi.org`, `*.pythonhosted.org` (strict
+    subdomains), `api.x.com:443`, `[::1]:8080`, `127.0.0.1:3000`, and - for `deny` only -
+    `*` and `*:<port>`. When several entries cover a host the most restrictive wins: `deny`,
+    then `inspect`, then `tunnel`. Hosts not covered are denied (unless the approval callback
+    or an exec's `extra_allowed_domains` allows them as tunnels)."""
     denied_resolved_addresses: list[str] = []
     """Extra CIDRs allowed hostnames must not resolve to (on top of the built-in set)."""
     deny_private_addresses: bool = True
@@ -62,16 +112,15 @@ class NetworkPolicy(_Strict):
     """Name -> host Unix socket, bridged to a loopback port inside and exposed as
     `SANDBOX_SVC_<NAME>_URL`."""
 
-    @field_validator("allowed_domains")
+    @field_validator("hosts")
     @classmethod
-    def _allowed(cls, v: list[str]) -> list[str]:
-        parse_network(v, allow_star=False)
-        return v
-
-    @field_validator("denied_domains")
-    @classmethod
-    def _denied(cls, v: list[str]) -> list[str]:
-        parse_network(v, allow_star=True)
+    def _hosts(cls, v: dict[str, HostAccess]) -> dict[str, HostAccess]:
+        seen: dict[tuple[str, int | None], str] = {}
+        for rule, pattern in zip(_compile_hosts(v), v, strict=True):
+            key = (rule.domain.pattern, rule.domain.port)
+            if key in seen:
+                raise ValueError(f"host listed twice: {seen[key]!r} and {pattern!r}")
+            seen[key] = pattern
         return v
 
     @field_validator("denied_resolved_addresses")
@@ -90,11 +139,20 @@ class NetworkPolicy(_Strict):
             _absolute([path])
         return v
 
-    def allowed_rules(self) -> list[DomainRule]:
-        return parse_network(self.allowed_domains, allow_star=False)
+    def host_rules(self) -> list[HostRule]:
+        return _compile_hosts(self.hosts)
 
-    def denied_rules(self) -> list[DomainRule]:
-        return parse_network(self.denied_domains, allow_star=True)
+
+def _compile_hosts(hosts: dict[str, HostAccess]) -> list[HostRule]:
+    return [
+        parse_host_rule(
+            pattern,
+            h.access,
+            allow=[f.compile() for f in h.allow],
+            deny=[f.compile() for f in h.deny],
+        )
+        for pattern, h in hosts.items()
+    ]
 
 
 class ResourceLimits(_Strict):
