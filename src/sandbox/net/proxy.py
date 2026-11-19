@@ -14,7 +14,10 @@ vetted one. For `inspect` hosts (`HostRule`) a CONNECT tunnel is terminated with
 certificate minted by the session CA (`mitm.CertificateAuthority`), every request inside is
 vetted against the host's deny and allow filters, and it is re-encrypted upstream with
 normal verification. Inspected hosts only speak HTTP(S) through the HTTP proxy: SOCKS
-tunnels to them are refused because they cannot be inspected.
+tunnels to them are refused because they cannot be inspected. An inspected host's
+credentials are added to a vetted request on its way upstream (see `credentials.py`), so
+the secrets never enter the sandbox; a credential placeholder anywhere it is not replaced
+(host names, request targets, forwarded headers, request bodies) gets the request refused.
 """
 
 import asyncio
@@ -27,6 +30,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from sandbox.net.credentials import BodyScan, CredentialRefused, Credentials
 from sandbox.net.events import NetworkEvent, Outcome, Protocol
 from sandbox.net.filter import (
     AddressDenied,
@@ -99,6 +103,7 @@ class FilteringProxy:
         *,
         exec_id: str,
         hosts: Sequence[HostRule],
+        credentials: Credentials | None = None,
         extra_allowed: Sequence[DomainRule],
         guard: AddressGuard,
         ca: CertificateAuthority | None = None,
@@ -117,6 +122,8 @@ class FilteringProxy:
         self._upstream_tls = upstream_tls or (ssl.create_default_context() if inspects else None)
         self._approve = approve
         self._on_event = on_event
+        self._credentials = credentials if credentials is not None else Credentials()
+        self._placeholders = self._credentials.scan
         self._connections = 0
         self._server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -175,6 +182,7 @@ class FilteringProxy:
         *,
         rule: str | None = None,
         status: int | None = None,
+        credentials: list[str] | None = None,
     ) -> None:
         event = NetworkEvent(
             exec_id=self.exec_id,
@@ -189,6 +197,7 @@ class FilteringProxy:
             method=sanitize(conn.method, 32) if conn.method else None,
             target=sanitize(conn.target, 500) if conn.target else None,
             status=status,
+            credentials=credentials or None,
         )
         with contextlib.suppress(Exception):  # a failing event sink must not break the proxy
             self._on_event(event)
@@ -202,6 +211,11 @@ class FilteringProxy:
         """Decide and resolve, or raise _Refused. The route's rules are the `inspect` rules
         covering the host - empty unless it is inspected. `log`: emit the allow event here
         (connection-level decisions) rather than per request."""
+        try:  # before DNS and the approval prompt see it
+            self._placeholders.check_host(host)
+        except CredentialRefused as e:
+            conn.host, conn.port = host, port
+            raise _Refused(403, e.reason, e.rule) from None
         d: Decision = await decide(
             host,
             port,
@@ -306,12 +320,15 @@ class FilteringProxy:
         # (SSL_CERT_FILE et al.) fails here and the connection drops.
         ctx = self._ca.server_context(route.host)
         try:
-            await asyncio.wait_for(writer.start_tls(ctx), HEAD_TIMEOUT_S)
+            tls_reader, tls_writer = await asyncio.wait_for(_start_tls(writer, ctx), HEAD_TIMEOUT_S)
         except OSError, TimeoutError:  # typically: the client rejected our certificate
             self._emit(conn, "malformed", "client TLS handshake failed (does it trust the CA?)")
             return
         conn.protocol = "https"
-        await self._serve(conn, reader, writer, None, tunnel=route)
+        try:
+            await self._serve(conn, tls_reader, tls_writer, None, tunnel=route)
+        finally:
+            tls_writer.close()  # before `_handle` closes the plain stream under it
 
     async def _serve(
         self,
@@ -390,13 +407,24 @@ class FilteringProxy:
         else:
             raise _Refused(400, "expected an origin-form request inside the tunnel")
         conn.host, conn.port, conn.target = route.host, route.port, target
+        reason, rule, allowed_by = route.reason, route.rule, ()
         if route.rules:
             verdict = judge_request(route.rules, head.method, target)
             if not verdict.allowed:
                 raise _Refused(403, verdict.reason, verdict.rule)
-            self._emit(conn, "allow", verdict.reason, rule=verdict.rule)
-        else:
-            self._emit(conn, "allow", route.reason, rule=route.rule)
+            reason, rule, allowed_by = verdict.reason, verdict.rule, verdict.allowed_by
+        # Credentials go in only now, only those of the host entries that allow this very
+        # request themselves (not of every entry covering the host), and only upstream
+        # over verified TLS (an intercepted tunnel). Then any placeholder still in what is
+        # about to be forwarded is one its credential was not used for.
+        try:
+            headers, used = self._credentials.apply(
+                allowed_by, _end_to_end(head.headers), secure=route.tls
+            )
+            self._placeholders.check_request(target, headers)
+        except CredentialRefused as e:
+            raise _Refused(403, e.reason, e.rule) from None
+        self._emit(conn, "allow", reason, rule=rule, credentials=used)
         try:
             up_reader, up_writer = await self._dial(
                 route.address, route.port, tls_host=route.host if route.tls else None
@@ -405,22 +433,33 @@ class FilteringProxy:
             raise _Refused(502, "upstream TLS handshake failed") from None
         except OSError, TimeoutError:
             raise _Refused(502, "upstream connection failed") from None
-        up_writer.write(_outbound_head(head, target, route))
+        up_writer.write(_outbound_head(head, headers, target, route))
         # The body goes up while the response comes down (`Expect: 100-continue` needs
-        # both at once); a failed upload closes the upstream, which ends the response.
-        upload = asyncio.create_task(_upload(reader, up_writer, body))
+        # both at once). A refused upload (a malformed body, a placeholder in it) stops
+        # short and closes the upstream, so the request is never complete there, and ends
+        # the response; the client then gets the refusal, unless a response is under way.
+        scan = self._placeholders.body() if self._placeholders else None
+        upload = asyncio.create_task(_upload(reader, up_writer, body, scan))
         upload.add_done_callback(lambda t: t.cancelled() or t.exception())
+        responding = asyncio.Event()
+        answered = False
         try:
-            keep = await _relay_response(up_reader, writer, head)
+            keep = await _relay_response(up_reader, writer, head, responding)
         except ConnectionAbortedError as e:  # the response broke after its head went out
             self._emit(conn, "failed", str(e))
             raise
+        except OSError, asyncio.IncompleteReadError, _Refused:
+            refusal = _refusal_of(upload)
+            if refusal is None or responding.is_set():
+                raise
+            answered = True  # `_serve` reports it and answers the client
+            raise refusal from None
         finally:
             failure = upload.exception() if upload.done() and not upload.cancelled() else None
             uploaded = upload.done() and not upload.cancelled() and failure is None
             upload.cancel()
             up_writer.close()
-            if isinstance(failure, _Refused):  # the client's body was malformed
+            if isinstance(failure, _Refused) and not answered:
                 self._refused(conn, failure)
         # If the body was not read to its end we cannot know where the next request starts.
         return keep and uploaded
@@ -566,19 +605,27 @@ def _request_framing(headers: list[tuple[str, str]]) -> int:
     return 0 if framing is None else framing  # a request without a length has no body
 
 
-def _outbound_head(head: _Head, target: str, route: _Route) -> bytes:
-    """The rewritten request head: canonical Host, hop-by-hop headers dropped, one request
-    per upstream connection (`Connection: close`)."""
-    listed = _tokens(head.headers, "connection")
+def _end_to_end(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The request headers to forward: hop-by-hop ones (including those the client lists
+    in `Connection`) and Host are dropped."""
+    listed = _tokens(headers, "connection")
+    return [
+        (n, v)
+        for n, v in headers
+        if (ln := n.lower()) not in _HOP_BY_HOP and ln not in listed and ln != "host"
+    ]
+
+
+def _outbound_head(
+    head: _Head, headers: list[tuple[str, str]], target: str, route: _Route
+) -> bytes:
+    """The rewritten request head with `headers` (`_end_to_end`, credentials applied):
+    canonical Host, one request per upstream connection (`Connection: close`)."""
     authority = f"[{route.host}]" if ":" in route.host else route.host
     if route.port != (443 if route.tls else 80):
         authority += f":{route.port}"
     out = [f"{head.method} {target} {head.version}", f"Host: {authority}"]
-    for n, v in head.headers:
-        ln = n.lower()
-        if ln in _HOP_BY_HOP or ln in listed or ln == "host":
-            continue
-        out.append(f"{n}: {v}")
+    out += [f"{n}: {v}" for n, v in headers]
     out.append("Connection: close")
     return ("\r\n".join(out) + "\r\n\r\n").encode("latin-1")
 
@@ -596,17 +643,31 @@ async def _next_head(reader: asyncio.StreamReader) -> bytes | None:
         return None
 
 
-async def _copy_exact(src: asyncio.StreamReader, dst: asyncio.StreamWriter, n: int) -> None:
+def _refusal_of(upload: asyncio.Task[None]) -> _Refused | None:
+    """The refusal an upload ended with, if it did."""
+    if not upload.done() or upload.cancelled():
+        return None
+    failure = upload.exception()
+    return failure if isinstance(failure, _Refused) else None
+
+
+async def _copy_exact(
+    src: asyncio.StreamReader, dst: asyncio.StreamWriter, n: int, scan: BodyScan | None = None
+) -> None:
     while n > 0:
         data = await src.read(min(n, 65536))
         if not data:
             raise asyncio.IncompleteReadError(b"", n)
+        if scan is not None:
+            scan.payload(data)  # before it is forwarded
         dst.write(data)
         await dst.drain()
         n -= len(data)
 
 
-async def _copy_chunked(src: asyncio.StreamReader, dst: asyncio.StreamWriter, status: int) -> None:
+async def _copy_chunked(
+    src: asyncio.StreamReader, dst: asyncio.StreamWriter, status: int, scan: BodyScan | None
+) -> None:
     """Relay a chunked body verbatim, stopping exactly after its last chunk and trailers."""
     while True:
         try:
@@ -616,48 +677,67 @@ async def _copy_chunked(src: asyncio.StreamReader, dst: asyncio.StreamWriter, st
         if not _CHUNK_SIZE.match(line):
             raise _Refused(status, "bad chunk")
         size = int(line.split(b";", 1)[0].rstrip(b"\r\n"), 16)
+        if scan is not None:
+            scan.line(line)  # chunk extensions
         dst.write(line)
         if size == 0:
             while (trailer := await src.readuntil(b"\r\n")) != b"\r\n":
+                if scan is not None:
+                    scan.line(trailer)
                 dst.write(trailer)
             dst.write(b"\r\n")
             await dst.drain()
             return
-        await _copy_exact(src, dst, size)
+        await _copy_exact(src, dst, size, scan)
         if await src.readexactly(2) != b"\r\n":
             raise _Refused(status, "bad chunk")
         dst.write(b"\r\n")
 
 
 async def _copy_body(
-    src: asyncio.StreamReader, dst: asyncio.StreamWriter, framing: int, status: int
+    src: asyncio.StreamReader,
+    dst: asyncio.StreamWriter,
+    framing: int,
+    status: int,
+    scan: BodyScan | None = None,
 ) -> None:
+    """`scan`: look for placeholders in a request body (UNTIL_CLOSE is responses only)."""
     if framing == CHUNKED:
-        await _copy_chunked(src, dst, status)
+        await _copy_chunked(src, dst, status, scan)
     elif framing == UNTIL_CLOSE:
         while data := await src.read(65536):
             dst.write(data)
             await dst.drain()
     else:
-        await _copy_exact(src, dst, framing)
+        await _copy_exact(src, dst, framing, scan)
     await dst.drain()
 
 
 async def _upload(
-    reader: asyncio.StreamReader, up_writer: asyncio.StreamWriter, framing: int
+    reader: asyncio.StreamReader,
+    up_writer: asyncio.StreamWriter,
+    framing: int,
+    scan: BodyScan | None,
 ) -> None:
     try:
-        await _copy_body(reader, up_writer, framing, 400)
+        await _copy_body(reader, up_writer, framing, 400, scan)
+    except CredentialRefused as e:
+        up_writer.close()  # mid-body: the upstream never gets a complete request
+        raise _Refused(403, e.reason, e.rule) from None
     except BaseException:
         up_writer.close()  # the upstream then ends its response instead of waiting
         raise
 
 
 async def _relay_response(
-    up_reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: _Head
+    up_reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: _Head,
+    responding: asyncio.Event,
 ) -> bool:
     """Relay interim responses and the final response, framed; returns whether the client
-    connection can carry another request."""
+    connection can carry another request. `responding` is set once the final response
+    head is on its way to the client (no other answer can be given after that)."""
     while True:
         try:
             raw = await up_reader.readuntil(b"\r\n\r\n")
@@ -693,12 +773,38 @@ async def _relay_response(
             out.append(f"{n}: {v}")
     if not keep:
         out.append("Connection: close")
+    responding.set()
     writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
     try:
         await _copy_body(up_reader, writer, framing, 502)
     except _Refused as e:  # the head is out: an error response would corrupt the stream
         raise ConnectionAbortedError(e.reason) from None
     return keep
+
+
+async def _start_tls(
+    writer: asyncio.StreamWriter, ctx: ssl.SSLContext
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Upgrade a client connection to TLS (server side), returning a fresh stream pair
+    over the TLS transport. The plain `writer` must stay referenced until the TLS one is
+    closed: a collected StreamWriter closes its transport.
+
+    Not `StreamWriter.start_tls()`: application data that arrives with the end of the
+    handshake is decrypted and handed to the stream's reader while that reader still holds
+    the plain transport. If it is enough to fill the reader (a large upload following the
+    ClientHello), the reader pauses the *plain* transport and later resumes the TLS one, so
+    the socket stays paused and the upload stalls for good (seen on Unix sockets, CPython
+    3.14). A fresh reader has no transport until the handshake is done, so it cannot pause
+    the wrong one."""
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(limit=HEAD_LIMIT, loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    await writer.drain()
+    transport = await loop.start_tls(writer.transport, protocol, ctx, server_side=True)
+    if transport is None:  # the connection went away during the handshake
+        raise ConnectionResetError("closed during the TLS handshake")
+    protocol.connection_made(transport)  # start_tls() leaves that to the caller
+    return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
 
 
 async def _refuse(writer: asyncio.StreamWriter, e: _Refused) -> None:

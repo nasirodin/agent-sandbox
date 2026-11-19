@@ -280,7 +280,10 @@ class HostRule:
     - `deny`: connections are refused.
     - `tunnel`: connections are allowed and relayed untouched (nothing is decrypted).
     - `inspect`: reachable through the HTTP proxy only; TLS is intercepted and every request
-      must match no `deny` filter and at least one `allow` filter.
+      must match no `deny` filter and at least one `allow` filter. The entry's
+      credentials are not part of the rule: they are kept apart, with their secrets, in
+      `credentials.Credentials`, and added to the requests the entry itself allows
+      (`RequestVerdict.allowed_by`).
     """
 
     domain: DomainRule
@@ -325,6 +328,10 @@ class RequestVerdict:
     rule: str | None = None
     """The filter that decided, as `<host entry>: <allow|deny> <filter>`; None for the
     built-in refusals and when no allow filter matches."""
+    allowed_by: tuple[str, ...] = ()
+    """For an allowed request: the host entries (as written) whose *own* allow filters
+    match it - the entries whose credentials it gets (`Credentials.apply`). An entry that
+    covers the host but does not allow the request lends it none of its credentials."""
 
 
 def request_denial(rules: Sequence[HostRule], method: str, target: str) -> str | None:
@@ -341,6 +348,9 @@ def judge_request(rules: Sequence[HostRule], method: str, target: str) -> Reques
     Filters see the percent-decoded path. Escapes that would change its structure (`%2e`,
     `%2f`, `%5c`, `%00`) and dot segments are refused outright, so decoding cannot turn a
     request into one that reaches a different resource than the filters saw.
+
+    One entry's allow filter is enough to let the request through, but only the entries
+    that allow it themselves are listed in `RequestVerdict.allowed_by`.
     """
     refused = _refusal_before_filters(target)
     if refused is not None:
@@ -352,13 +362,18 @@ def judge_request(rules: Sequence[HostRule], method: str, target: str) -> Reques
             if f.matches(req, deny=True):
                 rule = f"{r.domain.source}: deny {f.source}"
                 return RequestVerdict(False, "request matches a deny filter", rule)
+    decided: str | None = None
+    allowed_by: list[str] = []
     for r in rules:
-        for f in r.allow:
-            if f.matches(req, deny=False):
-                return RequestVerdict(
-                    True, "allow filter matches", f"{r.domain.source}: allow {f.source}"
-                )
-    return RequestVerdict(False, "no allow filter matches")
+        f = next((f for f in r.allow if f.matches(req, deny=False)), None)
+        if f is None:
+            continue  # this entry does not allow the request: its credentials stay out
+        if decided is None:
+            decided = f"{r.domain.source}: allow {f.source}"
+        allowed_by.append(r.domain.source)
+    if decided is None:
+        return RequestVerdict(False, "no allow filter matches")
+    return RequestVerdict(True, "allow filter matches", decided, tuple(allowed_by))
 
 
 def _refusal_before_filters(target: str) -> str | None:

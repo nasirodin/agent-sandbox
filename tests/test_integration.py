@@ -1,15 +1,20 @@
 """Escape probes against a real sandbox: each attack must fail. Needs bwrap and python3."""
 
 import asyncio
+import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from sandbox import (
+    Credential,
+    CredentialError,
     FilesystemPolicy,
     HostAccess,
     NetworkPolicy,
@@ -252,3 +257,142 @@ async def test_network_audit_log(dirs: dict[str, Path], upstream: int) -> None:
     assert {e.exec_id for e in lines} == {r.network_events[0].exec_id}
     assert lines[0].connection != lines[1].connection
     assert [v.detail for v in r.violations] == ["malformed http (bad request line)"]
+
+
+async def test_credentials_never_enter_the_sandbox(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret, key = "ghp_hostOnlySecret0123456789", "hostOnlyApiKey-9876"
+    placeholder = "SANDBOX_PLACEHOLDER_GITHUB_TOKEN"
+    monkeypatch.setenv("SANDBOX_TEST_API_KEY", key)  # host environment only
+    received: list[bytes] = []
+    ca = CertificateAuthority(dirs["outside"] / "upstream-ca")
+
+    async def handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        head = await r.readuntil(b"\r\n\r\n")
+        received.append(head)
+        ok = f"Authorization: Bearer {secret}".encode() in head
+        ok = ok and f"X-Api-Key: {key}".encode() in head
+        body = b"authorized" if ok else b"anonymous!"
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n" + body)
+        await w.drain()
+        w.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ca.server_context("127.0.0.1"))
+    port = server.sockets[0].getsockname()[1]
+    policy = SandboxPolicy(
+        filesystem=FilesystemPolicy(allow_write=[str(dirs["ws"])]),
+        network=NetworkPolicy(
+            hosts={
+                f"127.0.0.1:{port}": HostAccess(
+                    access="inspect",
+                    allow=[RequestFilter(methods=["GET"])],
+                    credentials=[
+                        Credential(secret=SecretStr(secret), placeholder=placeholder),
+                        Credential(
+                            header="X-Api-Key", secret_env="SANDBOX_TEST_API_KEY", inject="{secret}"
+                        ),
+                    ],
+                )
+            }
+        ),
+        env={"HOME": str(dirs["ws"]), "GITHUB_TOKEN": placeholder},
+    )
+    fetch = (
+        "import os, sys, urllib.request as u\n"
+        "auth = {'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN']}\n"
+        "req = u.Request(sys.argv[1], headers=auth)\n"
+        "print(u.urlopen(req, timeout=10).read().decode())\n"
+    )
+    env = {"NO_PROXY": "", "no_proxy": ""}
+    try:
+        async with Sandbox(policy, dirs["session"]) as sb:
+            assert sb._upstream_tls is not None
+            sb._upstream_tls.load_verify_locations(cadata=ca.ca_pem.decode())
+            r = await sb.exec(["python3", "-c", fetch, f"https://127.0.0.1:{port}/user"], env=env)
+            assert r.stdout == "authorized\n", r.stderr
+            (event,) = [e for e in r.network_events if e.protocol == "https"]
+            assert event.credentials == [
+                f"127.0.0.1:{port}: Authorization ({placeholder})",
+                f"127.0.0.1:{port}: X-Api-Key",
+            ]
+            # over plain http the placeholder stays a placeholder: the request is refused
+            r2 = await sb.exec(["python3", "-c", fetch, f"http://127.0.0.1:{port}/user"], env=env)
+            assert "403" in r2.stderr and "only sent over https" in r2.violations[0].detail
+            # the placeholder where it is not replaced: refused, as a possible exfiltration
+            r3 = await sb.exec(
+                ["python3", "-c", fetch, f"https://127.0.0.1:{port}/search?q={placeholder}"],
+                env=env,
+            )
+            assert "403" in r3.stderr and r3.stdout == ""
+            assert r3.violations[0].detail == (
+                f"deny https 127.0.0.1:{port} (credential placeholder in the request target: "
+                f"GET /search?q={placeholder}) [127.0.0.1:{port}: Authorization ({placeholder})]"
+            )
+            seen = await sh(sb, "env; cat /proc/self/environ; cat /proc/1/environ", env=env)
+    finally:
+        server.close()
+    assert len(received) == 1  # the refused requests never left the proxy
+    assert f"GITHUB_TOKEN={placeholder}" in seen.stdout
+    for value in (secret, key):
+        assert value not in seen.stdout + seen.stderr  # not in the sandbox's environment
+        for result in (r, r2, r3):
+            assert value not in result.model_dump_json()  # nor in results and events
+        for f in dirs["session"].rglob("*"):  # nor ever written to disk
+            assert not f.is_file() or value.encode() not in f.read_bytes()
+
+
+def leak_policy(dirs: dict[str, Path], env: dict[str, str]) -> SandboxPolicy:
+    return SandboxPolicy(
+        filesystem=FilesystemPolicy(allow_write=[str(dirs["ws"])]),
+        network=NetworkPolicy(
+            hosts={
+                "api.github.com": HostAccess(
+                    access="inspect",
+                    allow=[RequestFilter()],
+                    credentials=[
+                        Credential(secret_env="SANDBOX_TEST_GH", placeholder="PLACEHOLDER_GH")
+                    ],
+                )
+            }
+        ),
+        env={"HOME": str(dirs["ws"]), **env},
+    )
+
+
+async def test_secrets_cannot_be_passed_into_the_sandbox_env(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "ghp_hostOnlySecretForEnvTest42"
+    monkeypatch.setenv("SANDBOX_TEST_GH", secret)
+    # passed through in the policy by accident: the sandbox does not start
+    sb = Sandbox(leak_policy(dirs, {"GH_TOKEN": secret}), dirs["session"])
+    with pytest.raises(CredentialError, match="GH_TOKEN") as e:
+        await sb.start()
+    assert secret not in str(e.value)
+    # per exec: refused before anything runs; the sandbox stays usable
+    async with Sandbox(
+        leak_policy(dirs, {"GITHUB_TOKEN": "PLACEHOLDER_GH"}), dirs["session"]
+    ) as sb:
+        marker = dirs["ws"] / "ran"
+        with pytest.raises(CredentialError, match="AUTH") as e:
+            await sh(sb, f"touch {marker}", env={"AUTH": f"Bearer {secret}"})
+        assert secret not in str(e.value) and not marker.exists()
+        assert not os.listdir(dirs["session"] / "sock")  # its proxy is gone too
+        r = await sh(sb, "echo $GITHUB_TOKEN")  # the placeholder under the secret's name: fine
+        assert r.stdout == "PLACEHOLDER_GH\n"
+
+
+def test_cli_refuses_a_policy_passing_a_secret(dirs: dict[str, Path]) -> None:
+    secret = "ghp_hostOnlySecretForCliTest42"
+    policy = leak_policy(dirs, {"TOKEN": secret}).model_dump(mode="json")
+    path = dirs["outside"] / "policy.json"
+    path.write_text(json.dumps(policy))
+    out = subprocess.run(
+        [sys.executable, "-m", "sandbox.cli", "--policy", str(path), "--", "true"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SANDBOX_TEST_GH": secret},
+    )
+    assert out.returncode == 1 and secret not in out.stdout + out.stderr
+    assert "TOKEN (credential api.github.com: Authorization (PLACEHOLDER_GH))" in out.stderr

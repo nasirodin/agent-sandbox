@@ -1,12 +1,14 @@
 import asyncio
+import base64
 import re
 import ssl
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
 
+from sandbox.net.credentials import Credential, Credentials
 from sandbox.net.events import NetworkEvent
 from sandbox.net.filter import (
     AddressGuard,
@@ -208,15 +210,22 @@ def inspect(
     )
 
 
+type Entry = HostRule | tuple[HostRule, Sequence[Credential]]
+"""A host rule, or one with its credentials (`with_credentials`)."""
+
+
 async def make_rules_proxy(
-    tmp_path: Path, rules: list[HostRule], upstream_tls: ssl.SSLContext | None = None
+    tmp_path: Path, entries: Sequence[Entry], upstream_tls: ssl.SSLContext | None = None
 ) -> tuple[FilteringProxy, list[NetworkEvent], CertificateAuthority]:
+    pairs = [e if isinstance(e, tuple) else (e, ()) for e in entries]
+    rules = [r for r, _ in pairs]
     records: list[NetworkEvent] = []
     ca = CertificateAuthority(tmp_path / "ca")
     proxy = FilteringProxy(
         str(tmp_path / "p.sock"),
         exec_id="e1",
         hosts=rules,
+        credentials=Credentials({r.domain.source: cs for r, cs in pairs}),
         extra_allowed=[],
         guard=AddressGuard(local=set, allowed_literals=[r.domain for r in rules]),
         ca=ca,
@@ -391,6 +400,461 @@ async def test_inspected_host_refuses_socks(tmp_path: Path, upstream: tuple[Upst
     assert reply[:4] == b"\x05\x00" + b"\x05\x02"  # connection not allowed by ruleset
     assert records[-1].decision == "deny"
     assert records[-1].reason == "inspected host; use the HTTP proxy"
+
+
+# --- credentials -------------------------------------------------------------------------
+
+SECRET = "real-secret-value-42"
+PLACEHOLDER = "SANDBOX_PLACEHOLDER_TOKEN"
+
+
+def with_credentials(
+    host: str, *credentials: Credential, allow: list[dict] | None = None
+) -> tuple[HostRule, Sequence[Credential]]:
+    return inspect(host, allow), credentials
+
+
+def bearer(host: str, secret: str = SECRET) -> Credential:
+    return Credential("Authorization", secret, inject="Bearer {secret}", source=f"{host}: Auth")
+
+
+def stand_in(host: str, header: str = "Authorization", *, elsewhere: bool = False) -> Credential:
+    return Credential(
+        header,
+        SECRET,
+        placeholder=PLACEHOLDER,
+        source=f"{host}: {header} (ph)",
+        allow_placeholder_elsewhere=elsewhere,
+    )
+
+
+def assert_secret_not_in(records: list[NetworkEvent]) -> None:
+    assert all(SECRET not in r.model_dump_json() for r in records)
+
+
+async def test_injected_credential(tmp_path: Path, tls_upstream: tuple[TlsUpstream, int]) -> None:
+    up, port = tls_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    host = f"127.0.0.1:{port}"
+    rules = [with_credentials(host, bearer(host), allow=[{"path": "/ok/**"}])]
+    proxy, records, ca = await make_rules_proxy(tmp_path, rules, upstream_tls=trust)
+    r, w = await open_tunnel(tmp_path, port, ca)
+    # two requests on one tunnel, the second trying to get the header dropped as hop-by-hop
+    w.write(b"GET /ok/1 HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer fake\r\n\r\n")
+    first = await read_response(r)
+    w.write(b"GET /ok/2 HTTP/1.1\r\nHost: h\r\nConnection: Authorization\r\n\r\n")
+    second = await read_response(r)
+    w.write(b"GET /private HTTP/1.1\r\nHost: h\r\n\r\n")
+    refused = await read_response(r)
+    w.close()
+    await proxy.close()
+    assert first.startswith(b"HTTP/1.1 200") and second.startswith(b"HTTP/1.1 200")
+    assert refused.startswith(b"HTTP/1.1 403 no allow filter matches")
+    assert len(up.requests) == 2  # the refused request never got anywhere, credential or not
+    for sent in up.requests:
+        auth = [line for line in sent.split(b"\r\n") if line.lower().startswith(b"authorization")]
+        assert auth == [f"Authorization: Bearer {SECRET}".encode()]
+    https = [(e.decision, e.credentials) for e in records if e.protocol == "https"]
+    assert https == [("allow", [f"{host}: Auth"]), ("allow", [f"{host}: Auth"]), ("deny", None)]
+    assert_secret_not_in(records)
+
+
+async def test_placeholder_credential(
+    tmp_path: Path, tls_upstream: tuple[TlsUpstream, int]
+) -> None:
+    up, port = tls_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    host = f"127.0.0.1:{port}"
+    proxy, records, ca = await make_rules_proxy(
+        tmp_path, [with_credentials(host, stand_in(host))], upstream_tls=trust
+    )
+    ok = await tls_fetch(
+        tmp_path,
+        port,
+        ca,
+        f"GET /x HTTP/1.1\r\nHost: h\r\nAuthorization: token {PLACEHOLDER}\r\n\r\n".encode(),
+    )
+    plain = await tls_fetch(tmp_path, port, ca, b"GET /y HTTP/1.1\r\nAuthorization: mine\r\n\r\n")
+    await proxy.close()
+    assert ok.startswith(b"HTTP/1.1 200") and plain.startswith(b"HTTP/1.1 200")
+    sent = up.requests[0].decode()
+    assert f"Authorization: token {SECRET}\r\n" in sent and PLACEHOLDER not in sent
+    assert "Authorization: mine\r\n" in up.requests[1].decode()
+    https = [e.credentials for e in records if e.protocol == "https"]
+    assert https == [[f"{host}: Authorization (ph)"], None]
+    assert_secret_not_in(records)
+
+
+async def test_credentials_are_not_sent_over_plain_http(
+    tmp_path: Path, upstream: tuple[Upstream, int]
+) -> None:
+    up, port = upstream
+    host = f"127.0.0.1:{port}"
+    rules = [with_credentials(host, stand_in(host))]
+    proxy, records, _ = await make_rules_proxy(tmp_path, rules)
+    base = f"http://{host}"
+    refused = await talk(
+        tmp_path, f"GET {base}/a HTTP/1.1\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n".encode()
+    )
+    without = await talk(tmp_path, f"GET {base}/b HTTP/1.1\r\n\r\n".encode())
+    await proxy.close()
+    assert refused.startswith(b"HTTP/1.1 403 credentials are only sent over https")
+    assert without.startswith(b"HTTP/1.1 200")  # no credential involved: fine
+    assert len(up.requests) == 1 and up.requests[0].startswith(b"GET /b ")
+    assert (records[0].decision, records[0].rule) == ("deny", f"{host}: Authorization (ph)")
+    assert_secret_not_in(records)
+
+
+async def test_injecting_host_refuses_plain_http(
+    tmp_path: Path, upstream: tuple[Upstream, int]
+) -> None:
+    up, port = upstream
+    host = f"127.0.0.1:{port}"
+    proxy, _, _ = await make_rules_proxy(tmp_path, [with_credentials(host, bearer(host))])
+    resp = await talk(tmp_path, f"GET http://{host}/ HTTP/1.1\r\n\r\n".encode())
+    await proxy.close()
+    assert resp.startswith(b"HTTP/1.1 403 credentials are only sent over https")
+    assert not up.requests
+
+
+class BodyUpstream:
+    """Loopback HTTPS server that reads each request's whole body (Content-Length or
+    chunked) and answers only a complete request; keeps every byte it received."""
+
+    def __init__(self, ca: CertificateAuthority) -> None:
+        self.ca = ca
+        self.received: list[bytes] = []
+        self.complete: list[bool] = []
+
+    async def handle(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        data, complete = b"", False
+        try:
+            data = await r.readuntil(b"\r\n\r\n")
+            if m := re.search(rb"content-length: *(\d+)", data, re.I):
+                data += await r.readexactly(int(m.group(1)))
+            elif re.search(rb"transfer-encoding: *chunked", data, re.I):
+                data += await r.readuntil(b"\r\n0\r\n\r\n")
+            complete = True
+            w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await w.drain()
+        except asyncio.IncompleteReadError as e:
+            data += e.partial
+        except OSError, asyncio.LimitOverrunError:
+            pass
+        finally:
+            self.received.append(data)
+            self.complete.append(complete)
+            w.close()
+
+
+@pytest.fixture
+async def body_upstream(tmp_path: Path) -> AsyncIterator[tuple[BodyUpstream, int]]:
+    up = BodyUpstream(CertificateAuthority(tmp_path / "upstream-ca"))
+    server = await asyncio.start_server(
+        up.handle, "127.0.0.1", 0, ssl=up.ca.server_context("127.0.0.1"), limit=1 << 20
+    )
+    yield up, server.sockets[0].getsockname()[1]
+    server.close()
+
+
+def basic(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+ESCAPED = "%53" + PLACEHOLDER[1:]  # percent-encoded `S`
+
+
+@pytest.mark.parametrize(
+    ("request_bytes", "where"),
+    [
+        (f"GET /x?q={PLACEHOLDER} HTTP/1.1\r\n\r\n", "request target"),
+        (f"GET /x/{ESCAPED} HTTP/1.1\r\n\r\n", "request target"),
+        (f"GET /x HTTP/1.1\r\nX-Echo: {PLACEHOLDER}\r\n\r\n", "X-Echo header"),
+        (f"GET /x HTTP/1.1\r\nCookie: t={PLACEHOLDER}\r\n\r\n", "Cookie header"),
+        (f"GET /x HTTP/1.1\r\nX-Auth: {basic('u', PLACEHOLDER)}\r\n\r\n", "X-Auth header"),
+        # also next to a correctly placed one
+        (
+            f"GET /x HTTP/1.1\r\nAuthorization: Bearer {PLACEHOLDER}\r\n"
+            f"X-Copy: {PLACEHOLDER}\r\n\r\n",
+            "X-Copy header",
+        ),
+    ],
+)
+async def test_misplaced_placeholder_in_a_request_head_is_refused(
+    tmp_path: Path, body_upstream: tuple[BodyUpstream, int], request_bytes: str, where: str
+) -> None:
+    up, port = body_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    host = f"127.0.0.1:{port}"
+    proxy, records, ca = await make_rules_proxy(
+        tmp_path, [with_credentials(host, stand_in(host))], upstream_tls=trust
+    )
+    resp = await tls_fetch(tmp_path, port, ca, request_bytes.encode())
+    await proxy.close()
+    assert resp.startswith(f"HTTP/1.1 403 credential placeholder in the {where}".encode())
+    assert not up.received  # refused before anything went upstream
+    (event,) = [e for e in records if e.protocol == "https"]
+    assert (event.decision, event.rule, event.status) == (
+        "deny",
+        f"{host}: Authorization (ph)",
+        403,
+    )
+    assert event.violation and event.credentials is None
+
+
+@pytest.mark.parametrize("size", [1_000, 300_000, 5_000_000])
+async def test_large_upload_through_an_intercepted_tunnel(
+    tmp_path: Path, body_upstream: tuple[BodyUpstream, int], size: int
+) -> None:
+    """Regression: with `StreamWriter.start_tls()` an upload that followed the handshake
+    closely and overfilled the reader paused the plain socket for good (hung at ~256 KB)."""
+    up, port = body_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    proxy, _, ca = await make_rules_proxy(
+        tmp_path, [inspect(f"127.0.0.1:{port}")], upstream_tls=trust
+    )
+    r, w = await open_tunnel(tmp_path, port, ca)
+    w.write(b"POST /up HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % size + b"a" * size)
+    resp = await read_response(r)
+    w.close()
+    await proxy.close()
+    assert resp.startswith(b"HTTP/1.1 200") and up.complete == [True]
+    assert up.received[0].endswith(b"a" * 1000) and len(up.received[0]) > size
+
+
+def chunked(*chunks: bytes, trailer: bytes = b"") -> bytes:
+    body = b"".join(b"%x\r\n%s\r\n" % (len(c), c) for c in chunks)
+    return b"Transfer-Encoding: chunked\r\n\r\n" + body + b"0\r\n" + trailer + b"\r\n"
+
+
+PH = PLACEHOLDER.encode()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"Content-Length: %d\r\n\r\n" % (len(PH) + 7) + b"token=" + PH + b"&",
+        # far into a large body: found across reads
+        b"Content-Length: %d\r\n\r\n" % (300_001 + len(PH)) + b"a" * 300_001 + PH,
+        chunked(b"token=" + PH[:9], PH[9:] + b"&x=1"),  # split across chunks
+        chunked(b"x=1", trailer=b"X-Trailer: " + PH + b"\r\n"),
+        b"Transfer-Encoding: chunked\r\n\r\n3;ext=" + PH + b"\r\nx=1\r\n0\r\n\r\n",
+    ],
+)
+async def test_placeholder_in_a_request_body_is_refused(
+    tmp_path: Path, body_upstream: tuple[BodyUpstream, int], body: bytes
+) -> None:
+    up, port = body_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    host = f"127.0.0.1:{port}"
+    proxy, records, ca = await make_rules_proxy(
+        tmp_path, [with_credentials(host, stand_in(host))], upstream_tls=trust
+    )
+    r, w = await open_tunnel(tmp_path, port, ca)
+    w.write(b"POST /upload HTTP/1.1\r\nAuthorization: Bearer " + PH + b"\r\n" + body)
+    await w.drain()
+    resp = await asyncio.wait_for(r.read(), 5)
+    w.close()
+    for _ in range(100):  # the upstream notices the abort
+        if up.received:
+            break
+        await asyncio.sleep(0.01)
+    await proxy.close()
+    # the client is told; the upstream never got a complete request, nor the placeholder
+    assert resp.startswith(b"HTTP/1.1 403 credential placeholder in the request body")
+    assert up.complete == [False] and PH not in up.received[0]
+    https = [(e.decision, e.reason, e.request) for e in records if e.protocol == "https"]
+    assert https == [
+        ("allow", "allow filter matches", 1),  # the head was fine...
+        ("deny", "credential placeholder in the request body", 1),  # ...its body was not
+    ]
+    assert_secret_not_in(records)
+
+
+async def test_placeholder_sent_to_another_host_is_refused(
+    tmp_path: Path, pipeline: tuple[PipelineUpstream, int]
+) -> None:
+    up, port = pipeline
+    rules = [
+        with_credentials("api.example.com", stand_in("api.example.com")),
+        parse_host_rule(f"127.0.0.1:{port}", "tunnel"),
+    ]
+    proxy, records, _ = await make_rules_proxy(tmp_path, rules)
+    url = f"http://127.0.0.1:{port}"
+    header = await talk(
+        tmp_path, f"GET {url}/ HTTP/1.1\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n".encode()
+    )
+    git = await talk(  # `git push https://x:$TOKEN@127.0.0.1/...`
+        tmp_path,
+        f"GET {url}/ HTTP/1.1\r\nAuthorization: {basic('x', PLACEHOLDER)}\r\n\r\n".encode(),
+    )
+    body = await talk(
+        tmp_path,
+        f"POST {url}/ HTTP/1.1\r\nContent-Length: {len(PH)}\r\n\r\n".encode() + PH,
+    )
+    fine = await talk(tmp_path, f"GET {url}/ok HTTP/1.1\r\n\r\n".encode())
+    await up.settled(2)
+    await proxy.close()
+    for resp in (header, git):
+        assert resp.startswith(b"HTTP/1.1 403 credential placeholder in the Authorization header")
+    assert body.startswith(b"HTTP/1.1 403 credential placeholder in the request body")
+    assert fine.startswith(b"HTTP/1.1 200")
+    # only the POST's head (never completed) and the fine request went upstream
+    assert up.lines == ["POST / HTTP/1.1", "GET /ok HTTP/1.1"]
+    assert all(PH not in data for data in up.received)
+    denied = [e for e in records if e.decision == "deny"]
+    assert [e.reason.removeprefix("credential placeholder in the ") for e in denied] == [
+        "Authorization header",
+        "Authorization header",
+        "request body",
+    ]
+    # the refusals name the credential whose placeholder it is, on the host it was sent to
+    assert {(e.host, e.rule) for e in denied} == {
+        ("127.0.0.1", "api.example.com: Authorization (ph)")
+    }
+
+
+async def test_placeholder_in_a_host_name_is_refused(tmp_path: Path) -> None:
+    asked: list[NetworkRequest] = []
+
+    async def approve(req: NetworkRequest) -> bool:
+        asked.append(req)
+        return True
+
+    rules = [with_credentials("api.example.com", stand_in("api.example.com"))]
+    proxy, records, _ = await make_rules_proxy(tmp_path, rules)
+    proxy._approve = approve
+    name = f"{PLACEHOLDER.lower()}.attacker.example"  # DNS is case-insensitive
+    connect = await talk(tmp_path, f"CONNECT {name}:443 HTTP/1.1\r\n\r\n".encode())
+    http = await talk(tmp_path, f"GET http://x.{PLACEHOLDER}.example/ HTTP/1.1\r\n\r\n".encode())
+    raw = name.encode()
+    socks = await talk(
+        tmp_path, b"\x05\x01\x00", b"\x05\x01\x00\x03" + bytes([len(raw)]) + raw + b"\x01\xbb"
+    )
+    await proxy.close()
+    for resp in (connect, http):
+        assert resp.startswith(b"HTTP/1.1 403 credential placeholder in the host name")
+    assert socks == b"\x05\x00" + b"\x05\x02\x00\x01" + bytes(6)  # not allowed by ruleset
+    assert not asked  # never offered for approval
+    assert [(e.protocol, e.decision, e.reason) for e in records] == [
+        ("connect", "deny", "credential placeholder in the host name"),
+        ("http", "deny", "credential placeholder in the host name"),
+        ("socks5", "deny", "credential placeholder in the host name"),
+    ]
+
+
+async def test_placeholder_elsewhere_can_be_allowed(
+    tmp_path: Path,
+    body_upstream: tuple[BodyUpstream, int],
+    pipeline: tuple[PipelineUpstream, int],
+) -> None:
+    up, port = body_upstream
+    other, other_port = pipeline
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    host = f"127.0.0.1:{port}"
+    rules = [
+        with_credentials(host, stand_in(host, elsewhere=True)),
+        parse_host_rule(f"127.0.0.1:{other_port}", "tunnel"),
+    ]
+    proxy, records, ca = await make_rules_proxy(tmp_path, rules, upstream_tls=trust)
+    own = await tls_fetch(
+        tmp_path,
+        port,
+        ca,
+        f"POST /x?q={PLACEHOLDER} HTTP/1.1\r\nAuthorization: token {PLACEHOLDER}\r\n"
+        f"X-Echo: {PLACEHOLDER}\r\nContent-Length: {len(PH)}\r\n\r\n".encode()
+        + PH,
+    )
+    elsewhere = await talk(
+        tmp_path,
+        f"GET http://127.0.0.1:{other_port}/ HTTP/1.1\r\n"
+        f"Authorization: {PLACEHOLDER}\r\n\r\n".encode(),
+    )
+    await other.settled(1)
+    await proxy.close()
+    assert own.startswith(b"HTTP/1.1 200") and elsewhere.startswith(b"HTTP/1.1 200")
+    sent = up.received[0].decode()
+    # still only the credential's header is rewritten; the rest goes as it is
+    assert f"Authorization: token {SECRET}\r\n" in sent and sent.count(SECRET) == 1
+    assert sent.startswith(f"POST /x?q={PLACEHOLDER} ") and f"X-Echo: {PLACEHOLDER}\r\n" in sent
+    assert sent.endswith(PLACEHOLDER)
+    assert f"Authorization: {PLACEHOLDER}\r\n".encode() in other.received[0]
+    assert SECRET.encode() not in other.received[0]
+    assert not [e for e in records if e.decision == "deny"]
+
+
+async def test_conflicting_credentials_refuse_the_request(
+    tmp_path: Path, tls_upstream: tuple[TlsUpstream, int]
+) -> None:
+    up, port = tls_upstream
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    # two entries cover the host, each injecting its own Authorization
+    rules = [
+        with_credentials("127.0.0.1", bearer("127.0.0.1", "one")),
+        with_credentials(f"127.0.0.1:{port}", bearer(f"127.0.0.1:{port}", "two")),
+    ]
+    proxy, records, ca = await make_rules_proxy(tmp_path, rules, upstream_tls=trust)
+    resp = await tls_fetch(tmp_path, port, ca, b"GET / HTTP/1.1\r\n\r\n")
+    await proxy.close()
+    assert resp.startswith(b"HTTP/1.1 403 conflicting credentials for the Authorization header")
+    assert not up.requests
+    assert records[-1].rule == f"127.0.0.1: Auth, 127.0.0.1:{port}: Auth"
+
+
+async def test_credentials_only_ride_on_requests_their_own_entry_allows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """api.github.com allows GET /repos/** with a token; *.github.com allows everything
+    without one. A POST or DELETE gets through on the wildcard entry, but not the token."""
+    up = TlsUpstream(CertificateAuthority(tmp_path / "upstream-ca"))
+    server = await asyncio.start_server(
+        up.handle, "127.0.0.1", 0, ssl=up.ca.server_context("api.github.com")
+    )
+    port = server.sockets[0].getsockname()[1]
+    rules = [
+        with_credentials(
+            "api.github.com",
+            bearer("api.github.com"),
+            allow=[{"methods": ["GET"], "path": "/repos/**"}],
+        ),
+        inspect("*.github.com"),  # every method, no credentials
+    ]
+    trust = ssl.create_default_context(cadata=up.ca.ca_pem.decode())
+    proxy, records, ca = await make_rules_proxy(tmp_path, rules, upstream_tls=trust)
+
+    async def loopback(host: str, port: int) -> str:
+        return "127.0.0.1"
+
+    monkeypatch.setattr(proxy._guard, "resolve", loopback)
+    requests = [
+        b"GET /repos/o/r HTTP/1.1\r\n\r\n",
+        b"POST /repos/o/r/issues HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+        b"DELETE /repos/o/r HTTP/1.1\r\n\r\n",
+        b"GET /user HTTP/1.1\r\n\r\n",  # GET, but outside the token's paths
+    ]
+    responses: list[bytes] = []
+    for request in requests:
+        r, w = await asyncio.open_unix_connection(str(tmp_path / "p.sock"))
+        w.write(f"CONNECT api.github.com:{port} HTTP/1.1\r\n\r\n".encode())
+        assert (await r.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+        await w.start_tls(
+            ssl.create_default_context(cadata=ca.ca_pem.decode()), server_hostname="api.github.com"
+        )
+        w.write(request)
+        responses.append(await read_response(r))
+        w.close()
+    await proxy.close()
+    server.close()
+    assert all(resp.startswith(b"HTTP/1.1 200") for resp in responses)  # all allowed...
+    token = f"Authorization: Bearer {SECRET}".encode()
+    assert [token in sent for sent in up.requests] == [True, False, False, False]  # ...one token
+    https = [(e.method, e.credentials) for e in records if e.protocol == "https"]
+    assert https == [
+        ("GET", ["api.github.com: Auth"]),
+        ("POST", None),
+        ("DELETE", None),
+        ("GET", None),
+    ]
 
 
 # --- one message at a time ---------------------------------------------------------------

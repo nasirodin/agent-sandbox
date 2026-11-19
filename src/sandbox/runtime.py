@@ -116,8 +116,16 @@ class Sandbox:
         return self.session_dir / "empty"
 
     async def start(self) -> None:
+        """Raises `SandboxUnavailable` when the host cannot run the sandbox, and
+        `CredentialError` when a credential's `secret_env` is not set or a variable of
+        `SandboxPolicy.env` holds a credential's secret."""
         if errors := check_host(self.policy):
             raise SandboxUnavailable("; ".join(errors))
+        net = self.policy.network
+        self._hosts = net.host_rules()
+        # secrets are resolved here (host environment), held by the proxies only
+        self._credentials = net.resolve_credentials()
+        self._credentials.check_env(self.policy.env)  # fail early; every exec checks again
         arch = host_arch()
         assert arch is not None
         self._bwrap = self.policy.bwrap_path or shutil.which("bwrap") or "bwrap"
@@ -136,8 +144,6 @@ class Sandbox:
             os.path.dirname(self._python),
             str(BRIDGE.parent.resolve()),
         ]
-        net = self.policy.network
-        self._hosts = net.host_rules()
         self._guard = AddressGuard(
             extra=net.denied_resolved_addresses,
             deny_private=net.deny_private_addresses,
@@ -187,6 +193,8 @@ class Sandbox:
         stdin: bytes | None = None,
         extra_allowed_domains: Sequence[str] = (),
     ) -> ExecResult:
+        """Raises `CredentialError`, running nothing, when a variable of the command's
+        environment (`SandboxPolicy.env` and `env`) holds a credential's secret."""
         if not self._started:
             raise RuntimeError("Sandbox.start() has not been called")
         if not cmd:
@@ -211,6 +219,7 @@ class Sandbox:
             sock,
             exec_id=exec_id,
             hosts=self._hosts,
+            credentials=self._credentials,
             extra_allowed=parse_network(extra_allowed, allow_star=False),
             guard=self._guard,
             ca=self._ca,
@@ -278,6 +287,8 @@ class Sandbox:
                 "NODE_EXTRA_CA_CERTS": str(self._tls_dir / "ca.pem"),
             }
         full_env |= env or {}  # per-exec values last; proxy variables grant nothing anyway
+        # the complete environment of the command (bwrap --clearenv): no secret gets in
+        self._credentials.check_env(full_env)
         plan = plan_mounts(
             self.policy.filesystem,
             extra_read=self._runtime_read,

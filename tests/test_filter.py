@@ -315,11 +315,11 @@ def test_allow_filters(method: str, target: str, denial: str | None) -> None:
 
 
 def test_allow_query_needs_every_occurrence() -> None:
-    rules = inspect([{"path": "/**", "query": {"token": "tk-*"}}])
-    assert request_denial(rules, "GET", "/a?token=tk-1") is None
-    assert request_denial(rules, "GET", "/a?token=tk-1&other=2") is None  # unlisted: free
-    assert request_denial(rules, "GET", "/a?token=tk%2D1") is None  # values compare decoded
-    for target in ("/a", "/a?token=nope", "/a?token=tk-1&token=x", "/a?token=tk-1;token=x"):
+    rules = inspect([{"path": "/**", "query": {"ref": "ab-*"}}])
+    assert request_denial(rules, "GET", "/a?ref=ab-1") is None
+    assert request_denial(rules, "GET", "/a?ref=ab-1&other=2") is None  # unlisted: free
+    assert request_denial(rules, "GET", "/a?ref=ab%2D1") is None  # values compare decoded
+    for target in ("/a", "/a?ref=nope", "/a?ref=ab-1&ref=x", "/a?ref=ab-1;ref=x"):
         assert request_denial(rules, "GET", target) == "no allow filter matches", target
 
 
@@ -393,7 +393,7 @@ def test_policy_hosts() -> None:
 def test_glob_match_is_not_a_regex() -> None:
     import time
 
-    assert glob_match("tk-*", "tk-abc") and not glob_match("tk-*", "kt-abc")
+    assert glob_match("ab-*", "ab-abc") and not glob_match("ab-*", "ba-abc")
     assert glob_match("a*b*c", "aXbYc") and not glob_match("a*b*c", "aXcYb")
     assert glob_match("??", "ab") and not glob_match("??", "a")
     assert glob_match("*", "") and not glob_match("?", "")

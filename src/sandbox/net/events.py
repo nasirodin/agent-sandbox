@@ -44,6 +44,9 @@ class NetworkEvent(BaseModel):
     """Origin-form request target (path and query), truncated."""
     status: int | None = None
     """HTTP status the proxy answered a refusal with."""
+    credentials: list[str] | None = None
+    """Credentials the proxy added to the forwarded request (never their values):
+    `<host entry>: <header>`, or `<host entry>: <header> (<placeholder>)`."""
 
     @property
     def violation(self) -> bool:
